@@ -102,10 +102,10 @@ window.onerror = function(msg, src, line, col, err){
    "내 앱" 섹션의 웹 앱에서 이 형태의 config 객체를 복사할 수 있습니다.
    ========================================================================= */
 const firebaseConfig = {
-        apiKey: "AIzaSyBxlAWmJLvutf6_xyJ-zA3T1FutMAIVEDo",  
-        authDomain: "vernon-smith-stock-trade.firebaseapp.com",
-        databaseURL: "https://vernon-smith-stock-trade-default-rtdb.asia-southeast1.firebasedatabase.app",
-        projectId: "vernon-smith-stock-trade"
+  apiKey: "AIzaSyBxlAWmJLvutf6_xyJ-zA3T1FutMAIVEDo",  
+  authDomain: "vernon-smith-stock-trade.firebaseapp.com",
+  databaseURL: "https://vernon-smith-stock-trade-default-rtdb.asia-southeast1.firebasedatabase.app",
+  projectId: "vernon-smith-stock-trade"
 };
 /* ========================================================================= */
 
@@ -189,16 +189,18 @@ function fmt(n){
 }
 
 async function loadAll(){
-  const config = await getJSON('config', defaultConfig());
-  const round = await getJSON('round', null);
-  const historyObj = await getJSON('history', {});
+  // 읽기 실패(타임아웃) 시 화면이 초기 상태로 되돌아가지 않도록, 이전 상태를 대체값으로 사용
+  const config = await getJSON('config', S.config || defaultConfig());
+  const round = await getJSON('round', S.round || null);
+  const historyObj = await getJSON('history', null);
   S.config = config;
   S.round = round;
-  S.history = Object.values(historyObj || {}).sort((a,b)=>a.round-b.round);
+  if(historyObj !== null) S.history = Object.values(historyObj || {}).sort((a,b)=>a.round-b.round);
 
-  const participantsObj = await getJSON('participants', {});
-  S.participantNames = Object.keys(participantsObj || {});
-  S.players = await getJSON('players', {});
+  const participantsObj = await getJSON('participants', null);
+  if(participantsObj !== null) S.participantNames = Object.keys(participantsObj || {});
+  const playersObj = await getJSON('players', null);
+  if(playersObj !== null) S.players = playersObj;
   S.myPlayer = (S.safeName && S.players) ? (S.players[S.safeName] || null) : null;
 
   if(S.role === 'host'){
@@ -313,15 +315,23 @@ async function startSession(){
   const config = { status:'active', totalRounds, dividendValues, currentRound:1, hostClaimed:true, startPrice };
   const round = { round:1, status:'collecting', fundamentalValue: startPrice, clearingPrice:null, volume:null, dividendValue:null };
   await updatePaths({ '/config': config, '/round': round, '/history': null, '/orders': null, '/players': players });
+  S.history = [];
   S.busy = false;
   await loadAll();
 }
 
 async function calcEquilibrium(){
-  S.busy = true; render();
-  const round = S.round;
+  S.busy = true; S.flashError = ''; render();
+  // 서버의 최신 라운드 상태 기준으로 진행 (이미 계산됐으면 그대로 표시)
+  const round = await getJSON('round', S.round);
+  if(!round || round.status !== 'collecting'){
+    S.busy = false; await loadAll(); return;
+  }
   const ordersObj = await getJSON(`orders/${round.round}`, {});
-  const players = await getJSON('players', {});
+  const players = await getJSON('players', null);
+  if(!players || !Object.keys(players).length){
+    S.busy = false; S.flashError = '참가자 자산을 읽지 못했습니다. 새로고침 후 다시 시도하세요.'; render(); return;
+  }
   // 자산 검증: 매수는 현금이 호가 이상, 매도는 주식 1주 이상 보유해야 유효
   const bids = [], asks = [];
   Object.entries(ordersObj || {}).forEach(([name, o])=>{
@@ -354,10 +364,12 @@ async function calcEquilibrium(){
     else if(ba!=null) price = ba;
   }
   const trades = k>0 ? Array.from({length:k}, (_,i)=>({buyer:bids[i].name, seller:asks[i].name})) : [];
-  await updatePaths({
+  const ok = await updatePaths({
     '/round': {...round, status:'calculated', clearingPrice:price, volume:k, trades},
     '/players': players
   });
+  if(!ok){ S.busy = false; S.flashError = '체결 결과 저장에 실패했습니다. 새로고침 후 균형가 계산을 다시 눌러주세요.'; render(); return; }
+  S.flashError = '';
   S.busy = false;
   await loadAll();
 }
@@ -376,26 +388,56 @@ async function rollDice(){
 async function finishRoll(values){
   const final = rollWeightedDividend(values);
   S.rollDisplay = final; render();
-  const round = S.round;
+  // 중복 지급 방지: 서버의 현재 라운드 상태를 다시 확인
+  const round = await getJSON('round', S.round);
+  if(!round || round.status === 'revealed'){
+    S.rolling = false;
+    await loadAll();
+    return;
+  }
   // 배당 지급: 보유 주식 1주당 배당액만큼 현금 증가
-  const players = await getJSON('players', {});
-  Object.values(players || {}).forEach(p=>{
+  let players = await getJSON('players', null);
+  if(!players || !Object.keys(players).length){
+    // 읽기 실패 시 1회 재시도 — 자산 데이터를 빈 값으로 덮어쓰는 사고 방지
+    players = await getJSON('players', null);
+  }
+  if(!players || !Object.keys(players).length){
+    S.rolling = false;
+    S.flashError = '참가자 자산을 읽지 못해 배당을 확정하지 못했습니다. 새로고침 후 배당 추첨을 다시 눌러주세요.';
+    render(); return;
+  }
+  Object.values(players).forEach(p=>{
     p.cash = Math.round((p.cash + (p.shares||0) * final)*100)/100;
   });
   const updated = {...round, status:'revealed', dividendValue: final};
-  const histEntry = { round: round.round, fundamental: round.fundamentalValue, clearingPrice: round.clearingPrice, volume: round.volume, dividendValue: final };
-  await updatePaths({ '/round': updated, [`/history/${round.round}`]: histEntry, '/players': players });
+  const histEntry = { round: round.round, fundamental: round.fundamentalValue, clearingPrice: round.clearingPrice ?? null, volume: round.volume ?? null, dividendValue: final };
+  let ok = await updatePaths({ '/round': updated, [`/history/${round.round}`]: histEntry, '/players': players });
+  if(!ok){ ok = await updatePaths({ '/round': updated, [`/history/${round.round}`]: histEntry, '/players': players }); }
+  if(!ok){
+    S.rolling = false;
+    S.flashError = '배당 결과 저장에 실패했습니다. 새로고침 후 배당 추첨을 다시 눌러주세요.';
+    render(); return;
+  }
+  S.flashError = '';
   S.rolling = false;
   await loadAll();
 }
 
 async function nextRound(){
-  S.busy = true; render();
-  const config = S.config;
-  const newRoundNum = config.currentRound + 1;
+  S.busy = true; S.flashError = ''; render();
+  // 메모리의 낡은 값이 아니라 서버의 최신 라운드 번호를 기준으로 진행 (루프 방지)
+  const config = await getJSON('config', S.config);
+  if(!config || config.status !== 'active'){
+    S.busy = false; S.flashError = '서버에서 세션 정보를 읽지 못했습니다. 새로고침 후 다시 시도하세요.';
+    render(); return;
+  }
+  const freshRound = await getJSON('round', S.round);
+  const baseNum = Math.max(config.currentRound || 0, freshRound && freshRound.round ? freshRound.round : 0);
+  const newRoundNum = baseNum + 1;
   const expDiv = expectedDividend(config.dividendValues);
   const round = { round:newRoundNum, status:'collecting', fundamentalValue: computeFundamental(newRoundNum, config.totalRounds, expDiv), clearingPrice:null, volume:null, dividendValue:null };
-  await updatePaths({ '/config/currentRound': newRoundNum, '/round': round });
+  const ok = await updatePaths({ '/config/currentRound': newRoundNum, '/round': round });
+  if(!ok){ S.busy = false; S.flashError = '다음 라운드 저장에 실패했습니다. 다시 시도하세요.'; render(); return; }
   S.busy = false;
   await loadAll();
 }
@@ -439,7 +481,8 @@ async function submitOrder(pass){
 
 async function resetSession(){
   S.busy = true; render();
-  await updatePaths({ '/config': null, '/round': null, '/history': null, '/participants': null, '/orders': null, '/players': null });
+  const wiped = await updatePaths({ '/config': null, '/round': null, '/history': null, '/participants': null, '/orders': null, '/players': null });
+  if(wiped){ S.config = null; S.round = null; S.history = []; S.participantNames = []; S.players = {}; S.myPlayer = null; }
   S.confirmingReset = false; S.busy = false;
   S.editRounds = 10; S.editDividends = DEFAULT_DIVIDENDS.slice();
   await loadAll();
@@ -872,6 +915,7 @@ function renderHost(){
     <div class="eyebrow">host</div>
     <h1 style="font-size:22px; margin-bottom:10px;">진행자 콘솔</h1>
     ${renderTicker()}
+    ${S.flashError ? `<div class="panel panel-tight" style="border-color:var(--danger); color:var(--danger); font-size:13px;">${S.flashError}</div>` : ''}
     ${body}
     <hr class="divider"/>
     ${S.confirmingReset ? `
