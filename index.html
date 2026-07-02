@@ -189,13 +189,17 @@ function fmt(n){
 }
 
 async function loadAll(){
+  try{
   // 읽기 실패(타임아웃) 시 화면이 초기 상태로 되돌아가지 않도록, 이전 상태를 대체값으로 사용
   const config = await getJSON('config', S.config || defaultConfig());
   const round = await getJSON('round', S.round || null);
   const historyObj = await getJSON('history', null);
   S.config = config;
   S.round = round;
-  if(historyObj !== null) S.history = Object.values(historyObj || {}).sort((a,b)=>a.round-b.round);
+  // Firebase는 숫자 키(1,2,3...)를 배열로 변환해 반환할 수 있다 → [null, R1, R2] 형태의 null 구멍 제거 필수
+  if(historyObj !== null) S.history = Object.values(historyObj || {})
+    .filter(h => h && typeof h.round === 'number')
+    .sort((a,b)=>a.round-b.round);
   // 세션 교체 감지: 다른 세션의 기록이 화면에 남지 않도록 현재 sessionId 기준으로 필터
   if(config && config.sessionId){
     S.history = S.history.filter(h=>h.sessionId === config.sessionId);
@@ -219,6 +223,7 @@ async function loadAll(){
     S.myOrder = await getJSON(`orders/${round.round}/${S.safeName}`, null);
   }
   S.lastUpdated = new Date();
+  }catch(e){ console.error('loadAll 오류', e); }
   render();
 }
 
