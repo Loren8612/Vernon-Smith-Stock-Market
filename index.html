@@ -128,9 +128,12 @@ function defaultConfig(){
   return { status:'lobby', totalRounds:10, dividendValues: DEFAULT_DIVIDENDS.slice(), currentRound:0, hostClaimed:false };
 }
 
+function withTimeout(promise, ms){
+  return Promise.race([promise, new Promise((_,rej)=>setTimeout(()=>rej(new Error('DB timeout')), ms))]);
+}
 async function getJSON(path, fallback){
   try{
-    const snap = await db.ref(path).get();
+    const snap = await withTimeout(db.ref(path).get(), 7000);
     return snap.exists() ? snap.val() : fallback;
   }catch(e){ console.error('read failed', path, e); return fallback; }
 }
@@ -176,7 +179,7 @@ const S = {
   myOrder:null, bidInput:'', askInput:'', busy:false, rolling:false, rollDisplay:null,
   confirmingReset:false, editRounds:10, editDividends: DEFAULT_DIVIDENDS.slice(),
   lastUpdated:null, refreshing:false,
-  gateOk:false, gateError:'', inviteCode:null
+  gateOk:false, gateError:'', inviteCode:null, dbStatus:'checking'
 };
 let chart = null;
 
@@ -481,17 +484,26 @@ function render(){
 }
 
 function renderGate(){
+  let statusLine = '';
+  if(S.dbStatus === 'checking'){
+    statusLine = `<p class="small" style="margin-top:10px;">서버 연결 확인 중…</p>`;
+  } else if(S.dbStatus === 'ok'){
+    statusLine = `<p class="small" style="margin-top:10px; color:var(--bid);">✓ 서버 연결됨</p>`;
+  } else {
+    statusLine = `<p class="small" style="margin-top:10px; color:var(--danger);">✗ 데이터베이스에 연결할 수 없습니다. 파일 상단 firebaseConfig의 databaseURL이 Firebase 콘솔 → Realtime Database 화면에 표시된 실제 주소와 같은지 확인하세요.</p>`;
+  }
   return `
-    <div class="eyebrow">access</div>
-    <h1 style="font-size:24px; margin-bottom:6px;">초대 코드 입력</h1>
-    <p class="muted" style="margin-bottom:18px;">진행자에게 받은 초대 코드를 입력하세요.</p>
-    <div class="panel panel-tight">
+    <div class="eyebrow">vernon smith experiment</div>
+    <h1 style="font-size:28px; margin-bottom:4px;">버넌 스미스의 주식실험</h1>
+    <p class="muted" style="margin-bottom:22px;">참가형 자산시장 실험 도구입니다. 입장하려면 초대 코드가 필요합니다.</p>
+    <div class="panel">
       <label for="gateField">초대 코드</label>
       <div class="row">
-        <div style="flex:1;"><input id="gateField" type="text" placeholder="코드 입력" autocomplete="off" /></div>
+        <div style="flex:1;"><input id="gateField" type="text" placeholder="코드 입력" autocomplete="off" value="${(S.gateInput||'').replace(/"/g,'&quot;')}" /></div>
         <button class="primary" id="gateBtn">입장</button>
       </div>
       ${S.gateError ? `<p class="small" style="color:var(--danger); margin-top:8px;">${S.gateError}</p>` : ''}
+      ${statusLine}
     </div>
   `;
 }
@@ -501,7 +513,7 @@ function attachGateEvents(){
   const submit = ()=>{
     const val = (field.value||'').trim();
     if(val && S.inviteCode && val.toUpperCase() === String(S.inviteCode).toUpperCase()){
-      S.gateOk = true; S.gateError = '';
+      S.gateOk = true; S.gateError = ''; S.gateInput = '';
       try{ sessionStorage.setItem('bubblelab_gate','ok'); }catch(e){}
       render();
     } else {
@@ -509,7 +521,10 @@ function attachGateEvents(){
       render();
     }
   };
-  if(field){ field.focus(); field.onkeydown = (e)=>{ if(e.key==='Enter') submit(); }; }
+  if(field){
+    field.oninput = (e)=>{ S.gateInput = e.target.value; };
+    field.onkeydown = (e)=>{ if(e.key==='Enter') submit(); };
+  }
   if(btn) btn.onclick = submit;
 }
 
@@ -794,10 +809,22 @@ function attachParticipantEvents(){
 }
 async function init(){
   if(NEEDS_SETUP){ render(); return; }
-  S.inviteCode = await getJSON('settings/inviteCode', FALLBACK_CODE);
+  // 1) DB 응답을 기다리지 않고 즉시 첫 화면을 그린다 (연결이 멈춰도 빈 화면 방지)
+  S.inviteCode = FALLBACK_CODE;
   try{
     if(sessionStorage.getItem('bubblelab_gate') === 'ok') S.gateOk = true;
   }catch(e){}
+  render();
+  // 2) 배경에서 서버 연결 확인 + 서버에 저장된 초대 코드 반영 (7초 제한)
+  if(!db){ S.dbStatus = 'error'; render(); return; }
+  try{
+    const snap = await withTimeout(db.ref('settings/inviteCode').get(), 7000);
+    S.dbStatus = 'ok';
+    if(snap.exists()) S.inviteCode = snap.val();
+  }catch(e){
+    console.error('DB 연결 확인 실패', e);
+    S.dbStatus = 'error';
+  }
   render();
 }
 init();
