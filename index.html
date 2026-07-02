@@ -196,6 +196,12 @@ async function loadAll(){
   S.config = config;
   S.round = round;
   if(historyObj !== null) S.history = Object.values(historyObj || {}).sort((a,b)=>a.round-b.round);
+  // 세션 교체 감지: 다른 세션의 기록이 화면에 남지 않도록 현재 sessionId 기준으로 필터
+  if(config && config.sessionId){
+    S.history = S.history.filter(h=>h.sessionId === config.sessionId);
+  } else if(config && config.status !== 'active' && config.status !== 'ended'){
+    S.history = [];
+  }
 
   const participantsObj = await getJSON('participants', null);
   if(participantsObj !== null) S.participantNames = Object.keys(participantsObj || {});
@@ -314,8 +320,9 @@ async function startSession(){
   const expDiv = expectedDividend(dividendValues);
   const startPrice = computeFundamental(1, totalRounds, expDiv);
   const players = allocateHoldings(S.participantNames, startPrice);
-  const config = { status:'active', totalRounds, dividendValues, currentRound:1, hostClaimed:true, startPrice };
-  const round = { round:1, status:'collecting', fundamentalValue: startPrice, clearingPrice:null, volume:null, dividendValue:null };
+  const sessionId = Date.now();
+  const config = { status:'active', totalRounds, dividendValues, currentRound:1, hostClaimed:true, startPrice, sessionId };
+  const round = { round:1, status:'collecting', sessionId, fundamentalValue: startPrice, clearingPrice:null, volume:null, dividendValue:null };
   await updatePaths({ '/config': config, '/round': round, '/history': null, '/orders': null, '/players': players });
   S.history = [];
   S.busy = false;
@@ -436,7 +443,7 @@ async function finishRoll(values){
     p.cash = Math.round((p.cash + (p.shares||0) * final)*100)/100;
   });
   const updated = {...round, status:'revealed', dividendValue: final};
-  const histEntry = { round: round.round, fundamental: round.fundamentalValue, clearingPrice: round.clearingPrice ?? null, volume: round.volume ?? null, bestBid: round.bestBid ?? null, bestAsk: round.bestAsk ?? null, dividendValue: final, playerChanges };
+  const histEntry = { round: round.round, sessionId: round.sessionId ?? null, fundamental: round.fundamentalValue, clearingPrice: round.clearingPrice ?? null, volume: round.volume ?? null, bestBid: round.bestBid ?? null, bestAsk: round.bestAsk ?? null, dividendValue: final, playerChanges };
   let ok = await updatePaths({ '/round': updated, [`/history/${round.round}`]: histEntry, '/players': players });
   if(!ok){ ok = await updatePaths({ '/round': updated, [`/history/${round.round}`]: histEntry, '/players': players }); }
   if(!ok){
@@ -461,7 +468,7 @@ async function nextRound(){
   const baseNum = Math.max(config.currentRound || 0, freshRound && freshRound.round ? freshRound.round : 0);
   const newRoundNum = baseNum + 1;
   const expDiv = expectedDividend(config.dividendValues);
-  const round = { round:newRoundNum, status:'collecting', fundamentalValue: computeFundamental(newRoundNum, config.totalRounds, expDiv), clearingPrice:null, volume:null, dividendValue:null };
+  const round = { round:newRoundNum, status:'collecting', sessionId: config.sessionId ?? null, fundamentalValue: computeFundamental(newRoundNum, config.totalRounds, expDiv), clearingPrice:null, volume:null, dividendValue:null };
   const ok = await updatePaths({ '/config/currentRound': newRoundNum, '/round': round });
   if(!ok){ S.busy = false; S.flashError = '다음 라운드 저장에 실패했습니다. 다시 시도하세요.'; render(); return; }
   S.busy = false;
@@ -787,6 +794,8 @@ function signedAmt(v){
 function renderLastRoundFeedback(){
   if(!S.history.length || !S.safeName) return '';
   const last = S.history[S.history.length - 1];
+  // 현재 라운드의 '직전' 라운드 결산만 표시 (세션 교체·순서 꼬임 시 오표시 방지)
+  if(!S.round || last.round !== S.round.round - 1) return '';
   const ch = last.playerChanges ? last.playerChanges[S.safeName] : null;
   if(!ch) return '';
   const net = (ch.divCash||0) + (ch.sellCash||0) - (ch.buyCash||0);
